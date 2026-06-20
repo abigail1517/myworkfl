@@ -15,22 +15,46 @@ on:
         required: false
         default: ""
       shuffle:
-        description: "Pick a random video instead of oldest first? (true/false)"
-        required: false
+        description: "Pick a random video instead of oldest first?"
+        type: choice
+        options:
+          - "false"
+          - "true"
         default: "false"
       interval_minutes:
-        description: "Minutes between each post (default: 30)"
+        description: "Minutes between each post"
         required: false
         default: "30"
       max_posts:
-        description: "Max posts per run, 0 = post until folder is empty"
+        description: "Max posts per run (0 = until folder is empty)"
         required: false
         default: "0"
+      enable_action_caption:
+        description: "Include Action Caption line from CSV?"
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      enable_caption:
+        description: "Include main Caption from CSV?"
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
+      enable_hashtags:
+        description: "Include Hashtags from CSV?"
+        type: choice
+        options:
+          - "true"
+          - "false"
+        default: "true"
 
 jobs:
   post-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 6 hours — adjust to how many posts you need
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
@@ -49,14 +73,17 @@ jobs:
 
       - name: Run scheduler
         env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          UPLOAD_FOLDER_ID:        ${{ secrets.UPLOAD_FOLDER_ID }}
-          PROCESSED_FOLDER_ID:     ${{ secrets.PROCESSED_FOLDER_ID }}
-          X_STORAGE_STATE_JSON:    ${{ secrets.X_STORAGE_STATE_JSON }}
-          CAPTION_SOURCE:          ${{ github.event.inputs.caption_source || 'csv' }}
-          CUSTOM_CAPTION:          ${{ github.event.inputs.custom_caption }}
-          SHUFFLE_ORDER:           ${{ github.event.inputs.shuffle || 'false' }}
-          POSTS_CSV_PATH:          table.csv
-          INTERVAL_MINUTES:        ${{ github.event.inputs.interval_minutes || '30' }}
-          MAX_POSTS:               ${{ github.event.inputs.max_posts || '0' }}
+          GOOGLE_CREDENTIALS_JSON:  ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          UPLOAD_FOLDER_ID:         ${{ secrets.UPLOAD_FOLDER_ID }}
+          PROCESSED_FOLDER_ID:      ${{ secrets.PROCESSED_FOLDER_ID }}
+          X_STORAGE_STATE_JSON:     ${{ secrets.X_STORAGE_STATE_JSON }}
+          CAPTION_SOURCE:           ${{ github.event.inputs.caption_source || 'csv' }}
+          CUSTOM_CAPTION:           ${{ github.event.inputs.custom_caption }}
+          SHUFFLE_ORDER:            ${{ github.event.inputs.shuffle || 'false' }}
+          POSTS_CSV_PATH:           table.csv
+          INTERVAL_MINUTES:         ${{ github.event.inputs.interval_minutes || '30' }}
+          MAX_POSTS:                ${{ github.event.inputs.max_posts || '0' }}
+          ENABLE_ACTION_CAPTION:    ${{ github.event.inputs.enable_action_caption || 'true' }}
+          ENABLE_CAPTION:           ${{ github.event.inputs.enable_caption || 'true' }}
+          ENABLE_HASHTAGS:          ${{ github.event.inputs.enable_hashtags || 'true' }}
         run: python bulk_post_to_x.py
