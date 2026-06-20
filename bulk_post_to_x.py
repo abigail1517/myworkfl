@@ -32,8 +32,21 @@ import uuid
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+import io
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+# ── Force stdout to flush immediately (critical for GitHub Actions logs) ──────
+os.environ["PYTHONUNBUFFERED"] = "1"
+sys.stdout.reconfigure(line_buffering=True)
+
+
+def log(msg):
+    """Print with timestamp and immediate flush."""
+    ts = time.strftime("%H:%M:%S", time.gmtime())
+    print(f"[{ts}] {msg}", flush=True)
+
 
 # ── Identity ────────────────────────────────────────────────────────────────
 RUN_TAG = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
@@ -46,7 +59,7 @@ CAPTION_SOURCE = os.environ.get("CAPTION_SOURCE", "csv").strip().lower()
 CUSTOM_CAPTION_RAW = os.environ.get("CUSTOM_CAPTION", "")
 SHUFFLE = os.environ.get("SHUFFLE_ORDER", "false").lower() == "true"
 INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "30"))
-MAX_POSTS = int(os.environ.get("MAX_POSTS", "0"))  # 0 = unlimited
+MAX_POSTS = int(os.environ.get("MAX_POSTS", "0"))
 
 # ── Caption / hashtag toggles ────────────────────────────────────────────────
 ENABLE_ACTION_CAPTION = os.environ.get("ENABLE_ACTION_CAPTION", "true").strip().lower() == "true"
@@ -70,6 +83,7 @@ def get_env(name, required=True):
 
 
 def get_drive_service():
+    log("Connecting to Google Drive…")
     raw = get_env("GOOGLE_CREDENTIALS_JSON")
     info = json.loads(raw)
     creds = Credentials(
@@ -80,42 +94,54 @@ def get_drive_service():
         client_secret=info["client_secret"],
         scopes=["https://www.googleapis.com/auth/drive"],
     )
+    log("Refreshing Google credentials…")
     creds.refresh(Request())
+    log("Google Drive connected.")
     return build("drive", "v3", credentials=creds)
 
 
 def claim_file(service, file_id, current_name):
     claimed_name = f"{CLAIM_PREFIX}{RUN_TAG}__{current_name}"
+    log(f"Claiming '{current_name}'…")
     service.files().update(fileId=file_id, body={"name": claimed_name}).execute()
     check = service.files().get(fileId=file_id, fields="id,name").execute()
     if check.get("name") != claimed_name:
-        print(f"Lost claim race on '{current_name}'; skipping.")
+        log(f"Lost claim race on '{current_name}'; skipping.")
         return None
+    log(f"Claim confirmed: '{claimed_name}'")
     return claimed_name
 
 
 def release_claim(service, file_id, original_name):
     try:
         service.files().update(fileId=file_id, body={"name": original_name}).execute()
-        print(f"Released claim on '{original_name}'.")
+        log(f"Released claim on '{original_name}'.")
     except Exception as e:
-        print(f"Warning: could not release claim on {file_id}: {e}")
+        log(f"Warning: could not release claim on {file_id}: {e}")
 
 
 def fetch_video_from_drive():
+    """
+    Returns (file_meta_dict, local_path) or (None, None) if no videos left.
+    Uses chunked download with progress logging so large files don't
+    appear stuck.
+    """
     service = get_drive_service()
     folder_id = get_env("UPLOAD_FOLDER_ID")
 
+    log("Listing files in upload folder…")
     results = service.files().list(
         q=f"'{folder_id}' in parents and trashed=false",
         orderBy="createdTime asc",
         pageSize=20,
-        fields="files(id,name,mimeType)",
+        fields="files(id,name,mimeType,size)",
     ).execute()
 
     files = results.get("files", [])
+    log(f"Found {len(files)} file(s) in folder.")
+
     if not files:
-        print("No files found in the upload folder.")
+        log("No files found in the upload folder.")
         return None, None
 
     if SHUFFLE:
@@ -124,43 +150,64 @@ def fetch_video_from_drive():
     for file in files:
         name = file["name"]
         mime = file.get("mimeType", "")
+        size_bytes = int(file.get("size", 0))
+        size_mb = size_bytes / (1024 * 1024)
+
+        log(f"Checking: '{name}' ({mime}, {size_mb:.1f} MB)")
 
         if name.startswith(CLAIM_PREFIX):
-            print(f"Skipping '{name}' — already claimed.")
+            log(f"Skipping '{name}' — already claimed.")
             continue
         if not mime.startswith("video/"):
-            print(f"Skipping '{name}' — not a video ({mime}).")
+            log(f"Skipping '{name}' — not a video ({mime}).")
             continue
 
         claimed = claim_file(service, file["id"], name)
         if claimed is None:
             continue
 
-        print(f"Claimed '{name}' as '{claimed}'. Downloading…")
         local_path = f"/tmp/{name}"
-        data = service.files().get_media(fileId=file["id"]).execute()
-        with open(local_path, "wb") as f:
-            f.write(data)
+        log(f"Downloading '{name}' ({size_mb:.1f} MB) to {local_path}…")
+
+        # Chunked download with progress so we can see it's not stuck
+        request = service.files().get_media(fileId=file["id"])
+        buf = io.FileIO(local_path, mode="wb")
+        downloader = MediaIoBaseDownload(buf, request, chunksize=8 * 1024 * 1024)
+
+        done = False
+        last_logged_pct = -1
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                pct = int(status.progress() * 100)
+                # Log every 10% to avoid spamming
+                if pct >= last_logged_pct + 10:
+                    log(f"  Download progress: {pct}%")
+                    last_logged_pct = pct
+
+        buf.close()
+        log(f"Download complete: {local_path}")
 
         file["original_name"] = name
         file["claimed_name"] = claimed
         file["_service"] = service
         return file, local_path
 
-    print("No unclaimed video files found in the upload folder.")
+    log("No unclaimed video files found in the upload folder.")
     return None, None
 
 
 def move_to_processed(service, file_id, original_name):
     upload_id = get_env("UPLOAD_FOLDER_ID")
     processed_id = get_env("PROCESSED_FOLDER_ID")
+    log(f"Moving '{original_name}' to processed folder…")
     service.files().update(
         fileId=file_id,
         addParents=processed_id,
         removeParents=upload_id,
         body={"name": original_name},
     ).execute()
-    print(f"Moved '{original_name}' to processed folder.")
+    log(f"Moved '{original_name}' to processed folder.")
 
 
 # ── Caption helpers ──────────────────────────────────────────────────────────
@@ -174,14 +221,6 @@ def load_caption_rows(path):
 
 
 def build_text_csv(row):
-    """
-    Assemble post text from CSV row, respecting the three toggles:
-      ENABLE_ACTION_CAPTION  — first line (e.g. "Watch this!")
-      ENABLE_CAPTION         — main caption body
-      ENABLE_HASHTAGS        — hashtag block
-    Any disabled part is simply omitted. Blank lines between sections
-    are only added when both surrounding sections are enabled.
-    """
     parts = []
 
     if ENABLE_ACTION_CAPTION:
@@ -197,7 +236,6 @@ def build_text_csv(row):
     if ENABLE_HASHTAGS:
         hashtags = row.get("Hashtags", "").strip()
         if hashtags:
-            # Add blank line before hashtags only if there's text above
             if parts:
                 parts.append("")
             parts.append(hashtags)
@@ -206,42 +244,18 @@ def build_text_csv(row):
 
 
 def build_text_custom(raw):
-    """
-    For custom captions ENABLE_CAPTION / ENABLE_ACTION_CAPTION are not
-    applicable (the user typed the full text). Only ENABLE_HASHTAGS is
-    honoured — if disabled we strip any #word tokens from the custom text.
-    """
     text = raw.replace("\\n", "\n").strip()
-
     if not ENABLE_HASHTAGS:
-        # Remove lines that are purely hashtags and inline #tags
         filtered_lines = []
         for line in text.splitlines():
-            # Drop lines that are only hashtags / whitespace
             tokens = line.strip().split()
             if tokens and all(t.startswith("#") for t in tokens):
                 continue
-            # Strip inline hashtags from mixed lines
             cleaned = " ".join(t for t in tokens if not t.startswith("#")).strip()
             if cleaned:
                 filtered_lines.append(cleaned)
         text = "\n".join(filtered_lines).strip()
-
     return text
-
-
-def build_caption(rows=None):
-    """
-    Build the final caption string based on CAPTION_SOURCE and toggles.
-    Returns empty string if all parts are disabled.
-    """
-    if CAPTION_SOURCE == "custom":
-        if not CUSTOM_CAPTION_RAW.strip():
-            return ""
-        return build_text_custom(CUSTOM_CAPTION_RAW)
-    else:
-        row = random.choice(rows)
-        return build_text_csv(row)
 
 
 # ── Playwright helpers ───────────────────────────────────────────────────────
@@ -250,19 +264,20 @@ def save_debug_screenshot(page, label="debug"):
     try:
         path = f"/tmp/screenshot_{label}_{int(time.time())}.png"
         page.screenshot(path=path)
-        print(f"Debug screenshot saved: {path}")
+        log(f"Debug screenshot saved: {path}")
     except Exception as e:
-        print(f"Could not save screenshot: {e}")
+        log(f"Could not save screenshot: {e}")
 
 
 def wait_for_mask_gone(page, timeout=30000):
+    log("Waiting for mask overlay to clear…")
     try:
         page.wait_for_selector(
             '[data-testid="mask"]', state="hidden", timeout=timeout
         )
-        print("Mask overlay gone.")
+        log("Mask overlay gone.")
     except PWTimeout:
-        print("Mask still present — force-removing via JS.")
+        log("Mask still present — force-removing via JS.")
         page.evaluate("""
             () => {
                 const mask = document.querySelector('[data-testid="mask"]');
@@ -275,44 +290,53 @@ def wait_for_mask_gone(page, timeout=30000):
 
 
 def wait_for_page_idle(page, timeout=30000):
+    log("Waiting for network idle…")
     try:
         page.wait_for_load_state("networkidle", timeout=timeout)
+        log("Network idle.")
     except PWTimeout:
-        pass
+        log("Network idle timeout — continuing anyway.")
 
 
 def navigate_to_compose(page):
     for attempt in range(1, 4):
-        print(f"Navigating to compose (attempt {attempt})…")
+        log(f"Navigating to compose (attempt {attempt}/3)…")
 
+        log("  → Going to x.com/home…")
         page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45000)
         wait_for_page_idle(page, timeout=15000)
+        log("  → Waiting 3s for page settle…")
         page.wait_for_timeout(3000)
         wait_for_mask_gone(page, timeout=20000)
 
+        log("  → Going to x.com/compose/post…")
         page.goto("https://x.com/compose/post", wait_until="domcontentloaded", timeout=45000)
         wait_for_page_idle(page, timeout=15000)
+        log("  → Waiting 4s for compose settle…")
         page.wait_for_timeout(4000)
         wait_for_mask_gone(page, timeout=20000)
 
+        log("  → Checking for textarea…")
         try:
             page.wait_for_selector(
                 '[data-testid="tweetTextarea_0"]',
                 state="attached",
                 timeout=20000,
             )
-            print("Compose textarea ready.")
+            log("Compose textarea ready.")
             return True
         except PWTimeout:
             save_debug_screenshot(page, f"compose_fail_attempt{attempt}")
-            print(f"Textarea not found on attempt {attempt}.")
+            log(f"Textarea not found on attempt {attempt}.")
             if attempt < 3:
+                log("  Waiting 5s before retry…")
                 page.wait_for_timeout(5000)
 
     return False
 
 
 def js_focus_and_type(page, text):
+    log("Focusing textarea via JS…")
     page.evaluate("""
         () => {
             const el = document.querySelector('[data-testid="tweetTextarea_0"]');
@@ -323,14 +347,19 @@ def js_focus_and_type(page, text):
     page.keyboard.press("Control+a")
     page.wait_for_timeout(200)
 
-    for char in text:
+    log(f"Typing {len(text)} characters…")
+    for i, char in enumerate(text):
         if char == "\n":
             page.keyboard.press("Enter")
         else:
             page.keyboard.type(char, delay=15)
+        # Log every 50 chars so we can see typing is progressing
+        if (i + 1) % 50 == 0:
+            log(f"  Typed {i + 1}/{len(text)} chars…")
 
     page.wait_for_timeout(500)
 
+    log("Verifying text landed in textarea…")
     text_present = page.evaluate("""
         () => {
             const el = document.querySelector('[data-testid="tweetTextarea_0"]');
@@ -338,7 +367,7 @@ def js_focus_and_type(page, text):
         }
     """)
     if not text_present:
-        print("Warning: caption may not have landed — retrying type.")
+        log("Warning: caption may not have landed — retrying type.")
         page.evaluate("""
             () => {
                 const el = document.querySelector('[data-testid="tweetTextarea_0"]');
@@ -352,11 +381,14 @@ def js_focus_and_type(page, text):
             else:
                 page.keyboard.type(char, delay=25)
         page.wait_for_timeout(500)
+    else:
+        log("Text confirmed in textarea.")
 
 
 # ── X / Playwright posting ───────────────────────────────────────────────────
 
 def post_video_to_x(local_path, caption_text):
+    log("Launching browser…")
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -367,6 +399,7 @@ def post_video_to_x(local_path, caption_text):
                 "--disable-gpu",
             ],
         )
+        log("Browser launched.")
         context = browser.new_context(
             storage_state=STORAGE_STATE_PATH,
             viewport={"width": 1280, "height": 900},
@@ -377,10 +410,11 @@ def post_video_to_x(local_path, caption_text):
             ),
         )
         page = context.new_page()
+        log("Browser context and page created.")
 
         try:
             # ── 1. Check session ──────────────────────────────────────────
-            print("Loading X home…")
+            log("Loading X home to verify session…")
             page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45000)
             wait_for_page_idle(page, timeout=15000)
 
@@ -389,6 +423,7 @@ def post_video_to_x(local_path, caption_text):
                     "Session expired (redirected to login). "
                     "Refresh X_STORAGE_STATE_JSON secret."
                 )
+            log(f"Session valid. Current URL: {page.url}")
 
             page.wait_for_timeout(3000)
             wait_for_mask_gone(page, timeout=20000)
@@ -401,21 +436,22 @@ def post_video_to_x(local_path, caption_text):
 
             page.wait_for_timeout(1000)
 
-            # ── 3. Type caption (skip if empty) ───────────────────────────
+            # ── 3. Type caption ───────────────────────────────────────────
             if caption_text.strip():
-                print("Typing caption…")
+                log("Starting caption input…")
                 js_focus_and_type(page, caption_text)
-                print(f"Caption typed ({len(caption_text)} chars).")
+                log(f"Caption typed successfully ({len(caption_text)} chars).")
             else:
-                print("No caption text — skipping text input.")
+                log("No caption text — skipping text input (video only post).")
 
             # ── 4. Attach video ───────────────────────────────────────────
-            print("Attaching video…")
+            log("Looking for file input element…")
             file_input = page.locator('input[data-testid="fileInput"]').first
             try:
                 file_input.wait_for(state="attached", timeout=10000)
+                log("File input found via data-testid.")
             except PWTimeout:
-                print("fileInput not found directly — clicking attachments button…")
+                log("fileInput not found directly — clicking attachments button…")
                 page.evaluate("""
                     () => {
                         const btn = document.querySelector('[data-testid="attachments"]');
@@ -425,50 +461,73 @@ def post_video_to_x(local_path, caption_text):
                 page.wait_for_timeout(1500)
                 file_input = page.locator('input[type="file"]').first
                 file_input.wait_for(state="attached", timeout=10000)
+                log("File input found via type=file fallback.")
 
+            log(f"Setting file: {local_path}")
             file_input.set_input_files(local_path)
-            print("Video file set. Waiting for upload…")
+            log("Video file set on input. Waiting for upload to begin…")
 
             # ── 5. Wait for upload ────────────────────────────────────────
             progress_appeared = False
+            log("Waiting for upload progress bar to appear (up to 25s)…")
             try:
                 page.wait_for_selector(
                     '[data-testid="progressBar"]', state="visible", timeout=25000
                 )
                 progress_appeared = True
-                print("Upload started (progress bar visible).")
+                log("Upload started — progress bar visible.")
             except PWTimeout:
-                print("Progress bar did not appear — continuing.")
+                log("Progress bar did not appear — upload may have started silently.")
 
             if progress_appeared:
+                log("Waiting for upload to complete (up to 5 min)…")
+                start = time.time()
                 try:
-                    page.wait_for_selector(
-                        '[data-testid="progressBar"]', state="detached", timeout=300000
-                    )
-                    print("Upload complete.")
-                except PWTimeout:
-                    print("Warning: upload timed out after 5 min; continuing.")
+                    # Poll and log every 15s while waiting
+                    while True:
+                        try:
+                            page.wait_for_selector(
+                                '[data-testid="progressBar"]',
+                                state="detached",
+                                timeout=15000,
+                            )
+                            log("Upload complete — progress bar gone.")
+                            break
+                        except PWTimeout:
+                            elapsed = int(time.time() - start)
+                            log(f"  Still uploading… ({elapsed}s elapsed)")
+                            if elapsed > 300:
+                                log("Warning: upload exceeded 5 min — continuing anyway.")
+                                break
+                except Exception as e:
+                    log(f"Upload wait error: {e}")
             else:
-                page.wait_for_timeout(15000)
+                log("Waiting 15s as fallback for silent upload…")
+                for i in range(15):
+                    time.sleep(1)
+                    if (i + 1) % 5 == 0:
+                        log(f"  Fallback wait: {i + 1}s / 15s")
 
+            log("Giving X 5s extra for server-side processing…")
             page.wait_for_timeout(5000)
             wait_for_mask_gone(page, timeout=20000)
 
-            # ── 6. Submit ─────────────────────────────────────────────────
-            print("Submitting post…")
+            # ── 6. Submit post ────────────────────────────────────────────
+            log("Waiting for post button to become enabled…")
             try:
                 page.wait_for_selector(
                     '[data-testid="tweetButton"]:not([aria-disabled="true"])',
                     state="attached",
                     timeout=20000,
                 )
-                print("Post button enabled.")
+                log("Post button is enabled.")
             except PWTimeout:
-                print("Warning: button still disabled; trying anyway.")
+                log("Warning: button still shows disabled; attempting click anyway.")
                 save_debug_screenshot(page, "button_disabled")
 
             page.wait_for_timeout(1000)
 
+            log("Clicking post button via JS…")
             clicked = page.evaluate("""
                 () => {
                     const btn = document.querySelector('[data-testid="tweetButton"]');
@@ -481,38 +540,42 @@ def post_video_to_x(local_path, caption_text):
                 save_debug_screenshot(page, "button_not_found")
                 raise RuntimeError("Post button not found in DOM.")
 
-            print("Post button clicked.")
+            log("Post button clicked. Waiting for confirmation…")
 
-            # ── 7. Confirm ────────────────────────────────────────────────
+            # ── 7. Confirm submission ─────────────────────────────────────
             try:
                 page.wait_for_url(
                     lambda url: "/home" in url or "/compose" not in url,
                     timeout=25000,
                 )
-                print("Post confirmed — navigated away from compose.")
+                log("Post confirmed — navigated away from compose.")
             except PWTimeout:
+                log("No URL change — checking if compose dialog closed…")
                 try:
                     page.wait_for_selector(
                         '[data-testid="tweetTextarea_0"]',
                         state="detached",
                         timeout=8000,
                     )
-                    print("Compose closed — post likely submitted.")
+                    log("Compose textarea gone — post likely submitted.")
                 except PWTimeout:
                     save_debug_screenshot(page, "post_unconfirmed")
-                    print("Warning: could not confirm post. Manual check advised.")
+                    log("Warning: could not confirm post submission. Manual check advised.")
 
             page.wait_for_timeout(3000)
+            log("Closing browser…")
 
         finally:
             browser.close()
+            log("Browser closed.")
 
-    print("Posted to X successfully.")
+    log("Posted to X successfully.")
 
 
 # ── Single post cycle ────────────────────────────────────────────────────────
 
 def run_one_post():
+    log("Starting post cycle — fetching video from Drive…")
     file_meta, local_path = fetch_video_from_drive()
     if file_meta is None:
         return False
@@ -521,7 +584,7 @@ def run_one_post():
     original_name = file_meta["original_name"]
     file_id = file_meta["id"]
 
-    # ── Build caption with toggles applied ───────────────────────────────────
+    log("Building caption…")
     if CAPTION_SOURCE == "custom":
         if not CUSTOM_CAPTION_RAW.strip():
             release_claim(service, file_id, original_name)
@@ -531,19 +594,18 @@ def run_one_post():
         rows = load_caption_rows(CSV_PATH)
         caption = build_text_csv(random.choice(rows))
 
-    # Print what will actually be posted
-    print("\n── Post content ──────────────────────────────────────")
-    print(f"  Action caption : {'ON' if ENABLE_ACTION_CAPTION else 'OFF'}")
-    print(f"  Caption        : {'ON' if ENABLE_CAPTION else 'OFF'}")
-    print(f"  Hashtags       : {'ON' if ENABLE_HASHTAGS else 'OFF'}")
-    print(f"\n  Text to post:\n{caption if caption.strip() else '(no text — video only)'}")
-    print("──────────────────────────────────────────────────────\n")
+    log("\n── Post content ──────────────────────────────────────")
+    log(f"  Action caption : {'ON' if ENABLE_ACTION_CAPTION else 'OFF'}")
+    log(f"  Caption        : {'ON' if ENABLE_CAPTION else 'OFF'}")
+    log(f"  Hashtags       : {'ON' if ENABLE_HASHTAGS else 'OFF'}")
+    log(f"  Text to post   : {repr(caption) if caption.strip() else '(no text — video only)'}")
+    log("──────────────────────────────────────────────────────\n")
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if attempt > 1:
-                print(f"Retry attempt {attempt}/{MAX_RETRIES}…")
+                log(f"Retry attempt {attempt}/{MAX_RETRIES} — waiting {RETRY_WAIT_SEC}s…")
                 time.sleep(RETRY_WAIT_SEC)
             post_video_to_x(local_path, caption)
             last_error = None
@@ -552,10 +614,10 @@ def run_one_post():
             raise
         except Exception as e:
             last_error = e
-            print(f"Attempt {attempt} failed: {e}")
+            log(f"Attempt {attempt} failed: {e}")
 
     if last_error is not None:
-        print(f"All {MAX_RETRIES} attempts failed. Releasing claim.")
+        log(f"All {MAX_RETRIES} attempts failed. Releasing claim.")
         release_claim(service, file_id, original_name)
         try:
             os.remove(local_path)
@@ -579,7 +641,7 @@ def sleep_with_countdown(seconds):
     while remaining > 0:
         chunk = min(60, remaining)
         mins, secs = divmod(remaining, 60)
-        print(f"  Next post in {mins}m {secs}s…")
+        log(f"Next post in {mins}m {secs}s…")
         time.sleep(chunk)
         remaining -= chunk
 
@@ -587,58 +649,57 @@ def sleep_with_countdown(seconds):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    log("Writing X session state from secret…")
     state_json = get_env("X_STORAGE_STATE_JSON")
     with open(STORAGE_STATE_PATH, "w") as f:
         f.write(state_json)
+    log("Session state written.")
 
     interval_seconds = INTERVAL_MINUTES * 60
     post_count = 0
 
-    print(f"\nScheduler started — posting every {INTERVAL_MINUTES} minute(s).")
-    print(f"Caption source  : {CAPTION_SOURCE}")
-    print(f"Action caption  : {'ON' if ENABLE_ACTION_CAPTION else 'OFF'}")
-    print(f"Caption         : {'ON' if ENABLE_CAPTION else 'OFF'}")
-    print(f"Hashtags        : {'ON' if ENABLE_HASHTAGS else 'OFF'}")
-    if MAX_POSTS:
-        print(f"Max posts       : {MAX_POSTS}")
-    else:
-        print("Max posts       : unlimited")
+    log(f"Scheduler started — posting every {INTERVAL_MINUTES} minute(s).")
+    log(f"Caption source  : {CAPTION_SOURCE}")
+    log(f"Action caption  : {'ON' if ENABLE_ACTION_CAPTION else 'OFF'}")
+    log(f"Caption         : {'ON' if ENABLE_CAPTION else 'OFF'}")
+    log(f"Hashtags        : {'ON' if ENABLE_HASHTAGS else 'OFF'}")
+    log(f"Max posts       : {MAX_POSTS if MAX_POSTS else 'unlimited'}")
 
     while True:
-        print(f"\n{'='*55}")
-        print(f"Post #{post_count + 1} | {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-        print(f"{'='*55}")
+        log(f"\n{'='*55}")
+        log(f"Post #{post_count + 1} starting")
+        log(f"{'='*55}")
 
         try:
             posted = run_one_post()
         except SystemExit:
             raise
         except Exception as e:
-            print(f"ERROR in post cycle: {e}")
-            print("Continuing scheduler after interval.")
+            log(f"ERROR in post cycle: {e}")
+            log("Continuing scheduler after interval.")
             main._failed = getattr(main, "_failed", 0) + 1
             if main._failed >= 5:
-                sys.exit("5 consecutive failures. Exiting.")
+                sys.exit("5 consecutive failures — exiting.")
             sleep_with_countdown(interval_seconds)
             continue
 
         main._failed = 0
 
         if not posted:
-            print("No videos left. Exiting scheduler.")
+            log("No videos left in upload folder. Exiting scheduler.")
             break
 
         post_count += 1
-        print(f"Post #{post_count} done ✓")
+        log(f"Post #{post_count} complete ✓")
 
         if MAX_POSTS and post_count >= MAX_POSTS:
-            print(f"Reached MAX_POSTS={MAX_POSTS}. Exiting.")
+            log(f"Reached MAX_POSTS={MAX_POSTS}. Exiting.")
             break
 
-        print(f"\nSleeping {INTERVAL_MINUTES} minute(s) before next post…")
+        log(f"Sleeping {INTERVAL_MINUTES} minute(s) before next post…")
         sleep_with_countdown(interval_seconds)
 
-    print(f"\nScheduler finished. Total posts made: {post_count}")
+    log(f"Scheduler finished. Total posts made: {post_count}")
 
 
 if __name__ == "__main__":
