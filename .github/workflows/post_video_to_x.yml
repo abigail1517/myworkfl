@@ -1,0 +1,62 @@
+name: Post Video to X from Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      caption_source:
+        description: "Caption source"
+        type: choice
+        options:
+          - csv
+          - custom
+        default: csv
+      custom_caption:
+        description: "Only if caption_source=custom. Use \\n for line breaks."
+        required: false
+        default: ""
+      shuffle:
+        description: "Pick a random video instead of oldest first? (true/false)"
+        required: false
+        default: "false"
+      interval_minutes:
+        description: "Minutes between each post (default: 30)"
+        required: false
+        default: "30"
+      max_posts:
+        description: "Max posts per run, 0 = post until folder is empty"
+        required: false
+        default: "0"
+
+jobs:
+  post-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hours — adjust to how many posts you need
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install \
+            playwright \
+            google-api-python-client \
+            google-auth \
+            google-auth-httplib2
+          playwright install --with-deps chromium
+
+      - name: Run scheduler
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          UPLOAD_FOLDER_ID:        ${{ secrets.UPLOAD_FOLDER_ID }}
+          PROCESSED_FOLDER_ID:     ${{ secrets.PROCESSED_FOLDER_ID }}
+          X_STORAGE_STATE_JSON:    ${{ secrets.X_STORAGE_STATE_JSON }}
+          CAPTION_SOURCE:          ${{ github.event.inputs.caption_source || 'csv' }}
+          CUSTOM_CAPTION:          ${{ github.event.inputs.custom_caption }}
+          SHUFFLE_ORDER:           ${{ github.event.inputs.shuffle || 'false' }}
+          POSTS_CSV_PATH:          table.csv
+          INTERVAL_MINUTES:        ${{ github.event.inputs.interval_minutes || '30' }}
+          MAX_POSTS:               ${{ github.event.inputs.max_posts || '0' }}
+        run: python bulk_post_to_x.py
